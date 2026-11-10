@@ -144,7 +144,7 @@ class MemoryTrainingModule(pl.LightningModule):
             The answer-token loss.
         """
         loss = self.llm(**batch).loss
-        self.log("train_loss", loss.detach(), on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train_loss", loss.detach(), on_step=True, on_epoch=False, prog_bar=True)
         return loss
 
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:

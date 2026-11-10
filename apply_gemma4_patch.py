@@ -1,5 +1,6 @@
 # Save as apply_gemma4_patch.py and run `python apply_gemma4_patch.py` inside the project root
 import argparse
+import gc
 import glob
 import importlib.util
 import itertools
@@ -142,14 +143,21 @@ class PackedInt4ExpertParameter(nn.Module):
         return self.scales.dtype
 
     def __getitem__(self, expert_idx) -> torch.Tensor:
-        if isinstance(expert_idx, torch.Tensor) and expert_idx.numel() == 1:
+        if isinstance(expert_idx, torch.Tensor) and expert_idx.ndim == 0:
             expert_idx = int(expert_idx.item())
         packed_slice = self.packed_weight[expert_idx]
         scales_slice = self.scales[expert_idx].unsqueeze(-1)
+        half_group = self.group_size // 2
 
-        low = ((packed_slice & 0x0F).to(torch.bfloat16) - 8.0) * scales_slice
-        high = ((packed_slice >> 4).to(torch.bfloat16) - 8.0) * scales_slice
-        return torch.cat((low, high), dim=-1).flatten(-2)
+        # Unpack directly into a single pre-allocated BF16 buffer to avoid torch.cat peak doubling
+        out = torch.empty(
+            (*packed_slice.shape[:-1], self.group_size),
+            dtype=torch.bfloat16,
+            device=packed_slice.device,
+        )
+        out[..., :half_group] = ((packed_slice & 0x0F).to(torch.bfloat16) - 8.0) * scales_slice
+        out[..., half_group:] = ((packed_slice >> 4).to(torch.bfloat16) - 8.0) * scales_slice
+        return out.flatten(-2)
 
     def transpose(self, dim0: int, dim1: int) -> torch.Tensor:
         return self[:].transpose(dim0, dim1)
@@ -162,8 +170,10 @@ def _nf4_experts_forward(
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Zero-loop Batched GEMM (`torch.bmm`) MoE forward pass for quantized `Gemma4TextExperts`.
-    Collapses 256 per-expert `F.linear` kernel launches per layer into 2 `rocBLAS` `torch.bmm` calls.
+    Chunked Batched GEMM (`torch.bmm`) MoE forward pass for quantized `Gemma4TextExperts`.
+    Processes active experts in bounded chunks of 16 (`<= 126.8 MB` dequantized weight buffer
+    instead of `2.03 GB` for all `E_active` experts at once), eliminating multi-GB variable-shape
+    allocator fragmentation on Windows ROCm while preserving batched `rocBLAS` speed.
     """
     if top_k_index.is_floating_point():
         top_k_index, top_k_weights = top_k_weights, top_k_index
@@ -184,33 +194,50 @@ def _nf4_experts_forward(
         perm = torch.argsort(inv_idx)
         sorted_token_idx = torch.div(perm, top_k, rounding_mode="floor")
         sorted_inv = inv_idx[perm]
-        starts = torch.cumsum(counts, dim=0) - counts
+        ends = torch.cumsum(counts, dim=0)
+        starts = ends - counts
         pos_in_expert = torch.arange(perm.numel(), device=perm.device) - starts[sorted_inv]
-        max_count = int(counts.max().item())
         E_active = active_experts.numel()
+        starts_cpu = starts.tolist()
+        ends_cpu = ends.tolist()
+        counts_cpu = counts.tolist()
 
-    # Scatter routed tokens into padded 3D batch [E_active, max_count, H]
-    padded_x = hidden_flat.new_zeros((E_active, max_count, H))
-    padded_x[sorted_inv, pos_in_expert] = hidden_flat[sorted_token_idx]
-
-    # Single batched GEMM for gate_up_proj across all active experts
-    gate_up_w = self.gate_up_proj[active_experts].to(hidden_flat.dtype)
-    gate_up_out = torch.bmm(padded_x, gate_up_w.transpose(-1, -2))
-    del gate_up_w, padded_x
-    gate, up = gate_up_out.chunk(2, dim=-1)
-    hidden_mid = act_fn(gate) * up
-    del gate_up_out, gate, up
-
-    # Single batched GEMM for down_proj across all active experts
-    down_w = self.down_proj[active_experts].to(hidden_flat.dtype)
-    down_out = torch.bmm(hidden_mid, down_w.transpose(-1, -2))
-    del down_w, hidden_mid
-
-    # Gather valid token outputs, weight by router probabilities, and accumulate
-    valid_out = down_out[sorted_inv, pos_in_expert] * flat_weights[perm].unsqueeze(-1)
-    del down_out
     final_hidden_states = torch.zeros_like(hidden_flat)
-    final_hidden_states.index_add_(0, sorted_token_idx, valid_out.to(final_hidden_states.dtype))
+    EXPERT_CHUNK = 16
+
+    for start_e in range(0, E_active, EXPERT_CHUNK):
+        end_e = min(start_e + EXPERT_CHUNK, E_active)
+        chunk_experts = active_experts[start_e:end_e]
+        C_e = end_e - start_e
+
+        token_start = starts_cpu[start_e]
+        token_end = ends_cpu[end_e - 1]
+        chunk_max_count = max(counts_cpu[start_e:end_e])
+
+        chunk_token_idx = sorted_token_idx[token_start:token_end]
+        chunk_inv = sorted_inv[token_start:token_end] - start_e
+        chunk_pos = pos_in_expert[token_start:token_end]
+        chunk_w = flat_weights[perm[token_start:token_end]].unsqueeze(-1)
+
+        padded_x = hidden_flat.new_zeros((C_e, chunk_max_count, H))
+        padded_x[chunk_inv, chunk_pos] = hidden_flat[chunk_token_idx]
+
+        gate_up_w = self.gate_up_proj[chunk_experts].to(hidden_flat.dtype)
+        gate_up_out = torch.bmm(padded_x, gate_up_w.transpose(-1, -2))
+        del gate_up_w, padded_x
+        gate, up = gate_up_out.chunk(2, dim=-1)
+        hidden_mid = act_fn(gate) * up
+        del gate_up_out, gate, up
+
+        down_w = self.down_proj[chunk_experts].to(hidden_flat.dtype)
+        down_out = torch.bmm(hidden_mid, down_w.transpose(-1, -2))
+        del down_w, hidden_mid
+
+        valid_out = down_out[chunk_inv, chunk_pos] * chunk_w
+        del down_out
+        final_hidden_states.index_add_(0, chunk_token_idx, valid_out.to(final_hidden_states.dtype))
+        del valid_out
+
     return final_hidden_states.reshape(orig_shape)
 
 
@@ -313,7 +340,8 @@ def load_gemma4_text_decoder(
 
     # Checkpoint every Nth decoder layer (default 3 -> 10 of 30 layers checkpointed) so 64 GB
     # setups avoid recomputing all 30 layers during backward while keeping VRAM around ~29 GB.
-    ckpt_every_n = int(os.environ.get("MEMORILLA_CKPT_EVERY_N_LAYERS", "3"))
+    # Default to checkpointing every layer ("1") so dequantized expert weights are never held across layers
+    ckpt_every_n = int(os.environ.get("MEMORILLA_CKPT_EVERY_N_LAYERS", "1"))
     layer_idx = 0
     for module in model.modules():
         if module.__class__.__name__ == "Gemma4TextDecoderLayer":
@@ -337,6 +365,60 @@ def load_gemma4_text_decoder(
 
             module.forward = types.MethodType(_ckpt_layer_fwd, module)
 
+    # Compute lm_head + softcapping + cross_entropy only on valid answer tokens (labels != -100)
+    # in 128-token chunks (~134 MB fixed buffer) instead of [B, L, 262160] (6-14 GB variable buffer)
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
+    orig_model_fwd = model.forward
+
+    def _chunked_loss_forward(self, *f_args, **f_kwargs):
+        labels = f_kwargs.get("labels")
+        backbone = getattr(self, "model", None)
+        lm_head = getattr(self, "lm_head", None)
+        if labels is None or backbone is None or lm_head is None:
+            return orig_model_fwd(*f_args, **f_kwargs)
+
+        b_kwargs = dict(f_kwargs)
+        b_kwargs.pop("labels", None)
+        b_kwargs["use_cache"] = False
+        b_kwargs["return_dict"] = True
+
+        hidden_states = backbone(*f_args, **b_kwargs)[0]
+        shift_hidden = hidden_states[..., :-1, :].reshape(-1, hidden_states.size(-1))
+        shift_labels = labels[..., 1:].reshape(-1)
+        valid_mask = shift_labels != -100
+
+        text_cfg = getattr(self.config, "text_config", self.config)
+        softcap = getattr(text_cfg, "final_logit_softcapping", None)
+
+        if valid_mask.any():
+            valid_hidden = shift_hidden[valid_mask]
+            valid_labels = shift_labels[valid_mask]
+            total_loss = hidden_states.new_zeros((), dtype=torch.float32)
+
+            def _chunk_ce(h_chunk: torch.Tensor, l_chunk: torch.Tensor) -> torch.Tensor:
+                logits_c = lm_head(h_chunk)
+                if softcap is not None:
+                    logits_c = torch.tanh(logits_c / softcap) * softcap
+                return torch.nn.functional.cross_entropy(logits_c.float(), l_chunk, reduction="sum")
+
+            for i in range(0, valid_hidden.size(0), 128):
+                h_c = valid_hidden[i : i + 128]
+                l_c = valid_labels[i : i + 128]
+                if torch.is_grad_enabled() and h_c.requires_grad:
+                    chunk_loss = torch.utils.checkpoint.checkpoint(_chunk_ce, h_c, l_c, use_reentrant=False)
+                else:
+                    chunk_loss = _chunk_ce(h_c, l_c)
+                total_loss = total_loss + chunk_loss
+
+            loss = total_loss / valid_labels.numel()
+        else:
+            loss = (lm_head(shift_hidden[:1]).float().sum()) * 0.0
+
+        return CausalLMOutputWithPast(loss=loss, logits=None)
+
+    model.forward = types.MethodType(_chunked_loss_forward, model)
+
     model.eval()
     for param in model.parameters():
         param.requires_grad = False
@@ -356,14 +438,21 @@ def load_gemma4_text_decoder(
             )
             for p in model.parameters():
                 p.requires_grad = False
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return res
 
         model.resize_token_embeddings = _fast_resize
 
+    gc.collect()
     if isinstance(target_device, str) and target_device != "auto":
         model.to(target_device)
     elif torch.cuda.is_available():
         model.to("cuda:0")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return model
 
 
@@ -679,7 +768,8 @@ class CheckpointResumeManager:
         if torch.cuda.is_available():
             vram_alloc_gb = torch.cuda.memory_allocated() / (1024**3)
             vram_peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
-            mem_str = f"VRAM: {vram_alloc_gb:.1f}/{vram_peak_gb:.1f}GB"
+            vram_resv_gb = torch.cuda.memory_reserved() / (1024**3)
+            mem_str = f"VRAM: {vram_alloc_gb:.1f}/{vram_peak_gb:.1f}GB (Resv: {vram_resv_gb:.1f}GB)"
         else:
             vram_alloc_gb = 0.0
             vram_peak_gb = 0.0
@@ -749,6 +839,9 @@ class CheckpointResumeManager:
         )
         self.global_step += 1
         self.committed_micro_step = self.current_micro_step
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if self.log_every_steps > 0 and (self.global_step % self.log_every_steps == 0):
             self.log_step_metrics(step_dt)
@@ -849,7 +942,10 @@ class CheckpointResumeManager:
                 f"[Gemma4Resume] Fast-forwarding epoch {epoch_idx} DataLoader by "
                 f"{start_micro}/{self.total_micro_steps_in_epoch or '?'} micro-batches..."
             )
-            raw_iter = itertools.islice(raw_iter, start_micro, None)
+            if hasattr(raw_iter, "_sampler_iter"):
+                raw_iter._sampler_iter = itertools.islice(raw_iter._sampler_iter, start_micro, None)
+            else:
+                raw_iter = itertools.islice(raw_iter, start_micro, None)
 
         for batch in raw_iter:
             self.current_micro_step += 1
@@ -936,6 +1032,15 @@ def install_runtime_monkeypatch() -> None:
     MemoryModule initialization, AdamW optimizer, LRScheduler, DataLoader iteration, and Memorilla recipe/embedding
     helpers so both train.py and evaluate.py support Gemma 4 + automatic save/resume out of the box.
     """
+    # Hard-cap PyTorch HIP allocator at 65% of 63.8 GB (~41.5 GB) so it never spills into
+    # Windows WDDM Shared GPU Memory (System RAM) and C++ garbage_collection_threshold is active.
+    if torch.cuda.is_available():
+        vram_frac = float(os.environ.get("MEMORILLA_VRAM_FRACTION", "0.65"))
+        try:
+            torch.cuda.set_per_process_memory_fraction(vram_frac)
+        except Exception:
+            pass
+
     RESUME_MANAGER.reset()
 
     # 1. Alias text_config.hidden_size onto top-level Gemma4Config for AutoConfig.from_pretrained
@@ -1001,9 +1106,25 @@ def install_runtime_monkeypatch() -> None:
         torch.optim.lr_scheduler.LRScheduler.__init__ = _patched_sched_init
         torch.optim.lr_scheduler.LRScheduler._gemma4_patched = True
 
-    # 6. Hook DataLoader.__iter__ (ONLY RandomSampler training loaders, never val_dataloader)
+    # 6. Hook DataLoader (disable pin_memory hipHostMalloc overhead on Windows & fast-forward batch_sampler)
     if not getattr(torch.utils.data.DataLoader, "_gemma4_patched", False):
+        orig_dl_init = torch.utils.data.DataLoader.__init__
         orig_dl_iter = torch.utils.data.DataLoader.__iter__
+
+        def _patched_dl_init(self, *args, **kwargs):
+            if os.name == "nt":
+                kwargs["pin_memory"] = False
+            orig_dl_init(self, *args, **kwargs)
+
+        # 6. Hook DataLoader (disable pin_memory hipHostMalloc overhead on Windows)
+    if not getattr(torch.utils.data.DataLoader, "_gemma4_patched", False):
+        orig_dl_init = torch.utils.data.DataLoader.__init__
+        orig_dl_iter = torch.utils.data.DataLoader.__iter__
+
+        def _patched_dl_init(self, *args, **kwargs):
+            if os.name == "nt":
+                kwargs["pin_memory"] = False
+            orig_dl_init(self, *args, **kwargs)
 
         def _patched_dl_iter(self):
             is_train_sampler = isinstance(getattr(self, "sampler", None), torch.utils.data.RandomSampler)
@@ -1015,6 +1136,7 @@ def install_runtime_monkeypatch() -> None:
                 return RESUME_MANAGER.iterate_dataloader(lambda: orig_dl_iter(self))
             return orig_dl_iter(self)
 
+        torch.utils.data.DataLoader.__init__ = _patched_dl_init
         torch.utils.data.DataLoader.__iter__ = _patched_dl_iter
         torch.utils.data.DataLoader._gemma4_patched = True
 
