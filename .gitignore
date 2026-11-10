@@ -1,0 +1,60 @@
+# ==============================================================================
+# MemoryLLM (Gemma 4 26B-A4B Memorilla) - .gitignore
+# ==============================================================================
+
+# 1. Virtual Environments & Python Bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+
+# 2. Datasets, Precomputed Embeddings & Parquet Stores
+data/
+data_subsampled/
+data_10pct/
+embeddings/
+corpus/
+collections/
+*.parquet
+*.arrow
+
+# 3. Model Checkpoints, Weights & Training Runs
+checkpoints/
+runs/
+results/
+lightning_logs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.gguf
+*.tmp
+
+# 4. Pipeline Logs, Telemetry & Completion Markers
+*.log
+test_pipeline.log
+metrics_history.jsonl
+.complete
+.eval_complete
+
+# 5. Hugging Face & PyTorch Local Caches
+.cache/
+hf_cache/
+models--*/
+
+# 6. Environment Secrets & OS / IDE Metadata
+.env
+.env.local
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

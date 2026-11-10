@@ -1,0 +1,125 @@
+# ==============================================================================
+# Gemma 4 26B-A4B Memorilla 10% Subsampled Curriculum (Windows PowerShell)
+# Target Hardware: AMD Strix Halo (Radeon 8060S, 64 GB Unified VRAM Allocation)
+# ==============================================================================
+
+# 0. Activate Virtual Environment (Run one-time uv setup comments if fresh install)
+cd C:\AI\MemoryLLM
+# uv venv .venv
+.\.venv\Scripts\Activate.ps1
+# uv pip install --no-deps git+https://github.com/snap-stanford/memorilla.git
+# uv pip install -r requires.txt
+# huggingface-cli login
+
+# ------------------------------------------------------------------------------
+# 1. Strix Halo / Windows ROCm Memory, Kernel & Telemetry Configuration
+# ------------------------------------------------------------------------------
+$env:HIP_VISIBLE_DEVICES = "0"
+$env:CUDA_VISIBLE_DEVICES = "0"
+$env:PYTORCH_HIP_ALLOC_CONF = "expandable_segments:True"
+$env:TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL = "1"
+$env:TOKENIZERS_PARALLELISM = "false"
+
+# Checkpoint every decoder layer during backward() to prevent dequantized BF16
+# MoE expert weights from spilling into Shared GPU Memory (~43.5 / 63.8 GB peak)
+$env:MEMORILLA_CKPT_EVERY_N_LAYERS = "1"
+
+# Automatic rolling checkpoint cadence (saves every 50 optimizer steps OR every 15 minutes, plus on Ctrl+C)
+$env:MEMORILLA_SAVE_EVERY_STEPS = "50"
+$env:MEMORILLA_SAVE_EVERY_MINUTES = "15"
+
+# Live console telemetry (prints loss, grad_norm, lr, speed, ETA, and VRAM usage)
+$env:MEMORILLA_LOG_EVERY_STEPS = "1"
+$env:MEMORILLA_LOG_EVERY_MICRO_STEPS = "8"
+
+# ------------------------------------------------------------------------------
+# 2. One-Time Preparation (Patch Entrypoints, Subsample 10% Data, Warm-Start)
+#    (Idempotent: automatically skips datasets/checkpoints with .complete markers)
+# ------------------------------------------------------------------------------
+# 2a. Fetch upstream train.py / evaluate.py (if not present) and inject the Gemma 4 runtime monkeypatch
+python apply_gemma4_patch.py --memorilla_root .
+
+# 2b. Download & stratified-subsample 10% of the 3-stage datasets + row-aligned precomputed embeddings
+python subsample_data.py --data_dir .\data_10pct --ratio 0.10 --seed 42
+
+# 2c. Extract memorilla/Memorilla-Qwen3-8B Stage 2 weights and resize W_proj (4096 -> 2816 at 1/sqrt(2560) std)
+python prepare_gemma4_weights.py --output_dir .\checkpoints\gemma4_warmstart
+
+# ------------------------------------------------------------------------------
+# 3. Stage 1: Projection Alignment on 10% EnWiki (1 Epoch, Perceiver Frozen)
+#    Press Ctrl+C at any time to save an atomic checkpoint (last.ckpt + resume_latest)
+#    and pause; re-running this block automatically resumes from the last step.
+# ------------------------------------------------------------------------------
+$env:MEMORILLA_FREEZE_PERCEIVER = "1"
+$env:MEMORILLA_STAGE_DIR = ".\checkpoints\stage1_gemma4"
+
+python train.py --config configs/stage1_gemma4_10pct.yaml `
+    --decoder google/gemma-4-26B-A4B-it `
+    --pretrained_memory .\checkpoints\gemma4_warmstart `
+    --data_dir .\data_10pct `
+    --output_dir .\checkpoints\stage1_gemma4 `
+    --devices 1 `
+    --attn_implementation sdpa
+
+# ------------------------------------------------------------------------------
+# 4. Stage 2: General Reading Comprehension & QA Mixture (1 Epoch, Full Module)
+#    Note: Pointing --pretrained_memory to .\checkpoints\stage1_gemma4\memory.pt
+#    works whether Stage 1 finished the full epoch OR was stopped early via Ctrl+C.
+# ------------------------------------------------------------------------------
+$env:MEMORILLA_FREEZE_PERCEIVER = "0"
+$env:MEMORILLA_STAGE_DIR = ".\checkpoints\stage2_gemma4"
+
+python train.py --config configs/stage2_gemma4_10pct.yaml `
+    --decoder google/gemma-4-26B-A4B-it `
+    --pretrained_memory .\checkpoints\stage1_gemma4\memory.pt `
+    --data_dir .\data_10pct `
+    --output_dir .\checkpoints\stage2_gemma4 `
+    --devices 1 `
+    --attn_implementation sdpa
+
+# ------------------------------------------------------------------------------
+# 5. Stage 3: Downstream Multi-Task Fine-Tuning Across All 8 Benchmarks (5 Epochs)
+#    Saves epoch-00 .. epoch-04 for per-benchmark validation selection and
+#    auto-resumes mid-epoch from .\checkpoints\stage3_gemma4\last.ckpt if paused.
+# ------------------------------------------------------------------------------
+$env:MEMORILLA_FREEZE_PERCEIVER = "0"
+$env:MEMORILLA_STAGE_DIR = ".\checkpoints\stage3_gemma4"
+
+python train.py --config configs/stage3_gemma4_10pct.yaml `
+    --decoder google/gemma-4-26B-A4B-it `
+    --pretrained_memory .\checkpoints\stage2_gemma4\memory.pt `
+    --data_dir .\data_10pct `
+    --output_dir .\checkpoints\stage3_gemma4 `
+    --devices 1 `
+    --attn_implementation sdpa
+
+# ------------------------------------------------------------------------------
+# 6. Select Best Stage 3 Epoch per Benchmark on Validation Split
+# ------------------------------------------------------------------------------
+foreach ($ep in @("00", "01", "02", "03", "04")) {
+    $valDir = ".\results\gemma4_stage3_val_ep$ep"
+    $doneMarker = Join-Path $valDir ".eval_complete"
+    if (-not (Test-Path $doneMarker)) {
+        python evaluate.py `
+            --decoder google/gemma-4-26B-A4B-it `
+            --data_dir .\data_10pct `
+            --benchmark factkg `
+            --split validation `
+            --checkpoint ".\checkpoints\stage3_gemma4\epoch-$ep" `
+            --output_dir $valDir
+        if ($LASTEXITCODE -eq 0) {
+            New-Item -ItemType File -Path $doneMarker -Force | Out-Null
+        }
+    }
+}
+
+# ------------------------------------------------------------------------------
+# 7. Final Test Evaluation on All 8 Benchmarks Using Selected Stage 3 Checkpoint
+# ------------------------------------------------------------------------------
+python evaluate.py `
+    --decoder google/gemma-4-26B-A4B-it `
+    --data_dir .\data_10pct `
+    --benchmark all `
+    --split test `
+    --checkpoint .\checkpoints\stage3_gemma4\epoch-04 `
+    --output_dir .\results\gemma4_stage3_test_ep04

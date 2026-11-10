@@ -1,0 +1,26 @@
+# Core Deep Learning & Gemma 4 26B-A4B Model Loading
+torch>=2.4.0
+transformers>=5.0.0
+accelerate>=1.0.0
+safetensors>=0.8.0
+huggingface_hub>=1.5.0,<2.0.0
+tokenizers>=0.20.0
+einops>=0.8.0
+
+# Stanford SNAP Memorilla Module & Training/Evaluation Runtime
+memorilla @ git+https://github.com/snap-stanford/memorilla.git
+lightning>=2.6.0
+datasets>=4.0.0,<5.0.0
+nltk>=3.9.0
+rouge-score>=0.1.2
+filelock>=3.12.0
+
+# Dataset Subsampling & Parquet Processing (subsample_data.py)
+pyarrow>=24.0.0
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Configuration & Utilities
+PyYAML>=6.0.0
+tqdm>=4.66.0
+requests>=2.31.0

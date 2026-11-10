@@ -1,0 +1,36 @@
+# Save as configs/stage2_gemma4_10pct.yaml
+# Adapts configs/stage2_mixture.yaml (10 datasets) for full MemoryModule co-adaptation
+decoder: "google/gemma-4-26B-A4B-it"
+encoder: "Qwen/Qwen3-Embedding-4B"
+attn_implementation: "sdpa"
+
+# Warm-start from aligned Stage 1 checkpoint
+init_memory: "runs/gemma4_stage1/epoch-00/memory.pt"
+data_repo: "./data_subsampled"
+datasets:
+  - "squad_v2"
+  - "drop"
+  - "coqa"
+  - "pubmedqa"
+  - "quail"
+  - "pwc"
+  - "cnn_dailymail"
+  - "samsum"
+  - "dialogsum"
+  - "msmarco"
+output_dir: "runs/gemma4_stage2"
+
+num_memories: 16
+
+# Single-device batching (Matches official effective batch size: 4 x 32 x 1 = 128)
+devices: 1
+strategy: "auto"
+num_workers: 0
+batch_size: 4
+gradient_accumulation_steps: 32
+max_epochs: 1
+
+# Optimization hyper-parameters (AdamW, cosine decay to 10% peak LR, clip 1.0, bf16-mixed)
+learning_rate: 1.5e-4
+weight_decay: 0.01
+seed: 23

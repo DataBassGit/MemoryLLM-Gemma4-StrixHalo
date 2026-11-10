@@ -1,0 +1,28 @@
+# Save as configs/stage1_gemma4_10pct.yaml
+# Adapts configs/stage1_enwiki.yaml for single-device projection alignment
+decoder: "google/gemma-4-26B-A4B-it"
+encoder: "Qwen/Qwen3-Embedding-4B"
+attn_implementation: "sdpa"
+
+# Warm-start from our surgically resized Qwen3-8B -> Gemma-4 checkpoint
+init_memory: "checkpoints/gemma4_warmstart/memory.pt"
+data_repo: "./data_subsampled"
+datasets:
+  - "enwiki"
+output_dir: "runs/gemma4_stage1"
+
+# Perceiver freezing is activated via `MEMORILLA_FREEZE_PERCEIVER=1` in Step 4
+num_memories: 16
+
+# Single-device batching (Matches official effective batch size: 4 x 32 x 1 = 128)
+devices: 1
+strategy: "auto"
+num_workers: 0
+batch_size: 4
+gradient_accumulation_steps: 32
+max_epochs: 1
+
+# Optimization hyper-parameters (AdamW, cosine decay to 10% peak LR, clip 1.0, bf16-mixed)
+learning_rate: 5.0e-4                      # Elevated LR for linear projection alignment
+weight_decay: 0.01
+seed: 23
