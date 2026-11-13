@@ -58,8 +58,18 @@ def ensure_available_splits(dataset_name: str, candidate_splits=("train", "valid
             raise RuntimeError(f"Could not download any splits for dataset '{dataset_name}'")
 
     # Ensure precomputed Qwen3-Embedding-4B vectors for this specific dataset are present in cache_root
-    existing_ds_embs = glob.glob(os.path.join(cache_root, "embeddings", "*", dataset_name, "*", "index.safetensors"))
-    if not existing_ds_embs:
+    from pathlib import Path
+    import memorilla.embeddings as me
+
+    def _needs_emb_download() -> bool:
+        existing_ds_embs = glob.glob(os.path.join(cache_root, "embeddings", "*", dataset_name, "*", "index.safetensors"))
+        if not existing_ds_embs:
+            return True
+        return any(me.missing_files(Path(p).parent) for p in existing_ds_embs)
+
+    for attempt in range(1, 6):
+        if not _needs_emb_download():
+            break
         try:
             snapshot_download(
                 repo_id="memorilla/Memorilla-Data",
@@ -69,9 +79,11 @@ def ensure_available_splits(dataset_name: str, candidate_splits=("train", "valid
                     f"embeddings/*/{dataset_name}/*/*",
                 ],
                 local_dir=cache_root,
+                max_workers=3,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"  [retry] snapshot_download attempt {attempt}/5 for {dataset_name}: {exc}")
+            time.sleep(3 * attempt)
     return cache_root
 
 
@@ -232,7 +244,15 @@ def subsample_memorilla_config(
             if q_files:
                 try:
                     with safe_open(q_files[0], framework="pt") as h:
-                        emb_aligned = int(h.get_slice("embeddings").get_shape()[0]) == expected_train_rows
+                        from pathlib import Path
+                        import memorilla.embeddings as me
+                        emb_aligned = (
+                            int(h.get_slice("embeddings").get_shape()[0]) == expected_train_rows
+                            and not any(
+                                me.missing_files(Path(p).parent)
+                                for p in glob.glob(os.path.join(output_repo, "embeddings", "*", dataset_name, "*", "index.safetensors"))
+                            )
+                        )
                 except Exception:
                     emb_aligned = False
             if not emb_aligned:

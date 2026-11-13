@@ -24,8 +24,8 @@ num_memories: 16
 devices: 1
 strategy: "auto"
 num_workers: 0
-batch_size: 2
-gradient_accumulation_steps: 32
+batch_size: 8
+gradient_accumulation_steps: 16
 max_epochs: 5
 
 # Official Stage 3 learning rate and regularization (bf16-mixed)

@@ -26,8 +26,8 @@ num_memories: 16
 devices: 1
 strategy: "auto"
 num_workers: 0
-batch_size: 4
-gradient_accumulation_steps: 32
+batch_size: 8
+gradient_accumulation_steps: 16
 max_epochs: 1
 
 # Optimization hyper-parameters (AdamW, cosine decay to 10% peak LR, clip 1.0, bf16-mixed)

@@ -415,6 +415,9 @@ def load_gemma4_text_decoder(
         else:
             loss = (lm_head(shift_hidden[:1]).float().sum()) * 0.0
 
+        if torch.is_grad_enabled():
+            RESUME_MANAGER.record_micro_loss(loss)
+
         return CausalLMOutputWithPast(loss=loss, logits=None)
 
     model.forward = types.MethodType(_chunked_loss_forward, model)
@@ -604,6 +607,10 @@ class CheckpointResumeManager:
         self.last_step_time: float = time.monotonic()
         self.ema_step_duration_s: float | None = None
         self.last_grad_norm: float = 0.0
+        self._step_loss_sum: float = 0.0
+        self._step_loss_count: int = 0
+        self.last_step_loss: float | None = None
+        self.ema_step_loss: float | None = None
         self.last_save_time: float = time.monotonic()
         self._signals_installed: bool = False
 
@@ -633,6 +640,10 @@ class CheckpointResumeManager:
                 self.current_epoch = self.resume_epoch
                 self.global_step = int(state.get("global_step", 0))
                 self.committed_micro_step = self.resume_micro_step
+                if state.get("last_step_loss") is not None:
+                    self.last_step_loss = float(state["last_step_loss"])
+                if state.get("ema_step_loss") is not None:
+                    self.ema_step_loss = float(state["ema_step_loss"])
                 print(
                     f"[Gemma4Resume] Found resumable state in {state_pt}: "
                     f"epoch={self.resume_epoch}, global_step={self.global_step}, "
@@ -726,6 +737,14 @@ class CheckpointResumeManager:
             return float(self.optimizer.param_groups[0].get("lr", 0.0))
         return 0.0
 
+    def record_micro_loss(self, loss: torch.Tensor) -> None:
+        if not torch.is_grad_enabled():
+            return
+        val = float(loss.detach().float().item())
+        if math.isfinite(val):
+            self._step_loss_sum += val
+            self._step_loss_count += 1
+
     def log_step_metrics(self, step_dt: float) -> None:
         now = time.monotonic()
         elapsed_s = now - self.run_start_time
@@ -742,7 +761,7 @@ class CheckpointResumeManager:
         )
 
         if total_m > 0 and cur_m > 0:
-            msteps_per_step = max(1.0, cur_m / max(1, self.global_step))
+            msteps_per_step = float(self.grad_accum) if self.grad_accum > 1 else max(1.0, cur_m / max(1, self.global_step))
             msteps_per_s = rate_steps_per_s * msteps_per_step
             rem_m_epoch = max(0, total_m - cur_m)
             eta_epoch_s = rem_m_epoch / max(1e-6, msteps_per_s)
@@ -775,9 +794,15 @@ class CheckpointResumeManager:
             vram_peak_gb = 0.0
             mem_str = "Dev: CPU"
 
+        loss_str = (
+            f"Loss: {self.last_step_loss:.4f} (EMA: {self.ema_step_loss:.4f}) | "
+            if self.last_step_loss is not None and self.ema_step_loss is not None
+            else ""
+        )
+
         print(
             f"[Gemma4Metrics] {ep_label} {ep_bar} | Step {self.global_step} ({mstep_str}) | "
-            f"LR: {lr:.2e} | GradNorm: {self.last_grad_norm:.4f} | ProjStd: {proj_std:.5f} | "
+            f"{loss_str}LR: {lr:.2e} | GradNorm: {self.last_grad_norm:.4f} | ProjStd: {proj_std:.5f} | "
             f"{step_dt:.2f}s/step | Elapsed: {format_duration(elapsed_s)} | "
             f"EpETA: {format_duration(eta_epoch_s)} | StageETA: {format_duration(eta_stage_s)} | "
             f"{mem_str} | SaveIn: {steps_to_save}st"
@@ -794,6 +819,8 @@ class CheckpointResumeManager:
                     "micro_step": cur_m,
                     "total_micro_steps": total_m,
                     "pct_epoch": round((cur_m / total_m) * 100.0, 2) if total_m > 0 else None,
+                    "step_loss": round(self.last_step_loss, 6) if self.last_step_loss is not None else None,
+                    "ema_loss": round(self.ema_step_loss, 6) if self.ema_step_loss is not None else None,
                     "lr": lr,
                     "grad_norm": round(self.last_grad_norm, 6),
                     "proj_weight_std": round(proj_std, 6),
@@ -840,6 +867,16 @@ class CheckpointResumeManager:
         self.global_step += 1
         self.committed_micro_step = self.current_micro_step
 
+        if self._step_loss_count > 0:
+            self.last_step_loss = self._step_loss_sum / self._step_loss_count
+            self.ema_step_loss = (
+                self.last_step_loss
+                if self.ema_step_loss is None
+                else (0.1 * self.last_step_loss + 0.9 * self.ema_step_loss)
+            )
+            self._step_loss_sum = 0.0
+            self._step_loss_count = 0
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -863,6 +900,8 @@ class CheckpointResumeManager:
             "epoch": self.current_epoch,
             "global_step": self.global_step,
             "committed_micro_step": self.committed_micro_step,
+            "last_step_loss": self.last_step_loss,
+            "ema_step_loss": self.ema_step_loss,
             "memory_state_dict": mem_sd,
             "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer is not None else None,
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
@@ -955,10 +994,15 @@ class CheckpointResumeManager:
                 and self.current_micro_step != self.committed_micro_step
             ):
                 bar = render_progress_bar(self.current_micro_step, self.total_micro_steps_in_epoch, width=10)
+                run_loss_str = (
+                    f" | RunLoss: {self._step_loss_sum / self._step_loss_count:.4f}"
+                    if self._step_loss_count > 0
+                    else ""
+                )
                 print(
                     f"[Gemma4Heartbeat] Ep {self.current_epoch + 1:02d} {bar} | "
                     f"Accumulating micro-batch {self.current_micro_step}/{self.total_micro_steps_in_epoch or '?'} "
-                    f"(last committed step={self.global_step}) | "
+                    f"(last committed step={self.global_step}){run_loss_str} | "
                     f"Elapsed: {format_duration(time.monotonic() - self.run_start_time)}"
                 )
             yield batch
@@ -1244,6 +1288,130 @@ def install_runtime_monkeypatch() -> None:
 
             _patched_ensure_emb._gemma4_patched = True
             memorilla.embeddings.ensure_embeddings = _patched_ensure_emb
+
+        # [GEMMA4_NO_MMAP_EMBEDDING_STORE]
+        # Replace safetensors mmap handles in EmbeddingStore with direct file seek+readinto
+        # to prevent Windows 0xC0000005 STATUS_ACCESS_VIOLATION across 250GB+ Stage 3 shards.
+        if hasattr(memorilla.embeddings, "EmbeddingStore") and not getattr(
+            memorilla.embeddings.EmbeddingStore, "_gemma4_no_mmap", False
+        ):
+            import json as _st_json
+            import struct as _st_struct
+
+            _ST_DTYPE_MAP = {
+                "F16": torch.float16,
+                "BF16": torch.bfloat16,
+                "F32": torch.float32,
+                "I64": torch.int64,
+                "I32": torch.int32,
+                "I16": torch.int16,
+                "I8": torch.int8,
+                "U8": torch.uint8,
+                "BOOL": torch.bool,
+            }
+
+            def _st_read_header(filepath):
+                with open(filepath, "rb") as fp:
+                    header_len = _st_struct.unpack("<Q", fp.read(8))[0]
+                    header = _st_json.loads(fp.read(header_len).decode("utf-8"))
+                base_offset = 8 + header_len
+                meta = {}
+                for k, v in header.items():
+                    if k == "__metadata__":
+                        continue
+                    dtype = _ST_DTYPE_MAP[v["dtype"]]
+                    shape = list(v["shape"])
+                    s_off, e_off = v["data_offsets"]
+                    nbytes = e_off - s_off
+                    nrows = shape[0] if shape else 1
+                    row_bytes = nbytes // max(1, nrows)
+                    meta[k] = (base_offset + s_off, dtype, shape, row_bytes)
+                return meta
+
+            def _st_read_slice(filepath, meta_tuple, start_row, num_rows):
+                byte_offset, dtype, shape, row_bytes = meta_tuple
+                out_shape = [num_rows] + shape[1:]
+                out = torch.empty(out_shape, dtype=dtype, device="cpu")
+                nbytes = num_rows * row_bytes
+                if nbytes > 0:
+                    buf = out.view(torch.uint8).numpy()
+                    view = memoryview(buf).cast("B")
+                    with open(filepath, "rb") as fp:
+                        fp.seek(byte_offset + start_row * row_bytes)
+                        read_total = 0
+                        while read_total < nbytes:
+                            n = fp.readinto(view[read_total:])
+                            if not n:
+                                raise EOFError(f"Unexpected EOF reading {filepath} at row {start_row}")
+                            read_total += n
+                return out
+
+            def _es_init(self, config, split, root=None, encoder=memorilla.embeddings.DEFAULT_ENCODER):
+                self.config = config
+                self.split = split
+                self.directory = memorilla.embeddings.embedding_dir(
+                    config, split, root if root is not None else memorilla.embeddings.data_root(), encoder
+                )
+                missing = memorilla.embeddings.missing_files(self.directory)
+                if missing:
+                    raise FileNotFoundError(f"Embeddings of {config}/{split} in {self.directory} lack {missing}.")
+                idx_path = self.directory / memorilla.embeddings.INDEX_FILE
+                idx_meta = _st_read_header(idx_path)
+                self.collection_ids = _st_read_slice(idx_path, idx_meta["collection_ids"], 0, idx_meta["collection_ids"][2][0])
+                self._shard = _st_read_slice(idx_path, idx_meta["shard"], 0, idx_meta["shard"][2][0])
+                self._start = _st_read_slice(idx_path, idx_meta["start"], 0, idx_meta["start"][2][0])
+                self._length = _st_read_slice(idx_path, idx_meta["length"], 0, idx_meta["length"][2][0])
+                self._handles = {}
+
+            def _es_open_meta(self, filename):
+                if filename not in self._handles:
+                    self._handles[filename] = _st_read_header(self.directory / filename)
+                return self._handles[filename]
+
+            @property
+            def _es_num_questions(self):
+                meta = self._open(memorilla.embeddings.QUESTIONS_FILE)[memorilla.embeddings.TENSOR_NAME]
+                return int(meta[2][0])
+
+            def _es_documents(self, collection_id):
+                position = self._position(collection_id)
+                if position is None:
+                    raise KeyError(f"Collection {collection_id} not found in {self.config}/{self.split}.")
+                shard = int(self._shard[position])
+                start = int(self._start[position])
+                length = int(self._length[position])
+                fname = memorilla.embeddings.SHARD_TEMPLATE.format(shard)
+                meta = self._open(fname)[memorilla.embeddings.TENSOR_NAME]
+                return _st_read_slice(self.directory / fname, meta, start, length)
+
+            def _es_question(self, row):
+                fname = memorilla.embeddings.QUESTIONS_FILE
+                meta = self._open(fname)[memorilla.embeddings.TENSOR_NAME]
+                return _st_read_slice(self.directory / fname, meta, int(row), 1)[0]
+
+            def _es_questions(self):
+                fname = memorilla.embeddings.QUESTIONS_FILE
+                meta = self._open(fname)[memorilla.embeddings.TENSOR_NAME]
+                return _st_read_slice(self.directory / fname, meta, 0, int(meta[2][0]))
+
+            memorilla.embeddings.EmbeddingStore.__init__ = _es_init
+            memorilla.embeddings.EmbeddingStore._open = _es_open_meta
+            memorilla.embeddings.EmbeddingStore.num_questions = _es_num_questions
+            memorilla.embeddings.EmbeddingStore.documents = _es_documents
+            memorilla.embeddings.EmbeddingStore.question = _es_question
+            memorilla.embeddings.EmbeddingStore.questions = _es_questions
+            memorilla.embeddings.EmbeddingStore._gemma4_no_mmap = True
+
+        # Disable pin_memory on unified-memory Strix Halo APU to avoid HIP host page-locking pressure
+        if hasattr(torch.utils.data, "DataLoader") and not getattr(torch.utils.data.DataLoader, "_gemma4_no_pin", False):
+            _orig_dl_init = torch.utils.data.DataLoader.__init__
+
+            def _patched_dl_init(self, *args, **kwargs):
+                kwargs["pin_memory"] = False
+                _orig_dl_init(self, *args, **kwargs)
+
+            torch.utils.data.DataLoader.__init__ = _patched_dl_init
+            torch.utils.data.DataLoader._gemma4_no_pin = True
 
         if hasattr(memorilla, "MemoryConfig") and not getattr(memorilla.MemoryConfig, "_gemma4_patched", False):
             orig_mc_init = memorilla.MemoryConfig.__init__
